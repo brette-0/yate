@@ -1,0 +1,6 @@
+# c3c build output
+/build/
+
+# Vendored C3 libraries are re-fetchable via `c3c vendor-fetch raylib6`.
+# Uncomment the next line if you prefer NOT to commit the binding blob.
+# /lib/*.c3l

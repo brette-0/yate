@@ -1,0 +1,14 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"type": "c3",
+			"request": "launch",
+			"name": "Debug C3 Program",
+			"program": "/home/brette/repos/yate/build/yate",
+			"args": [],
+			"cwd": "${workspaceFolder}",
+			"stopOnEntry": false
+		}
+	]
+}
