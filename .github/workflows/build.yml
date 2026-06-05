@@ -1,21 +1,18 @@
 # .github/workflows/build.yml
 #
-# Builds the project for three Linux targets with a single x86_64 c3c:
-#   linux-x64      (native)
-#   linux-x86      (32-bit, cross-compiled)
-#   linux-aarch64  (64-bit ARM, cross-compiled)
-#
-# Why one runner: c3c only ships an x86_64 Linux binary, so the non-x64 builds
-# are cross-compiled. c3c emits the right code via --target; the cross packages
-# below supply each target's libc + crt files so the LINK step succeeds.
+# Builds yate for Linux. Only linux-x64 is active: the raylib6.c3l dependency
+# ships prebuilt binaries for linux-x64 only, so 32-bit and aarch64 can't be
+# built without first producing raylib for those arches yourself (see notes at
+# the bottom of the matrix).
 
 name: build
 
 on:
   push:
-    tags: ["v*"]          # build + release on version tags
-  workflow_dispatch: {}
+    branches: [main]      # gives you the status tick on every push to main
+    tags: ["v*"]
   pull_request: {}
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -29,22 +26,26 @@ jobs:
       matrix:
         include:
           - target: linux-x64
-            apt: ""
-          - target: linux-x86
-            apt: "gcc-multilib libc6-dev-i386"
-          - target: linux-aarch64
-            apt: "crossbuild-essential-arm64 libc6-dev-arm64-cross"
+
+          # --- blocked by the raylib6.c3l dependency --------------------------
+          # linux-x86  : the c3l has no 32-bit raylib binary
+          #              ("Library 'raylib6' cannot be used with arch/os 'linux-x86'")
+          # linux-aarch64 : the c3l's bindings aren't defined for aarch64
+          #              (RLTraceLogCallback missing in raylib.c3i)
+          # To enable either, you must build raylib for that arch and drop it
+          # into raylib6.c3l/<target>/, then re-add the matrix entry here.
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive   # drop if you don't vendor deps as submodules
 
-      - name: Install cross libc (if needed)
-        if: matrix.apt != ''
+      - name: Install raylib system deps (X11 + GL)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }}
+          sudo apt-get install -y \
+            libx11-dev libxrandr-dev libxinerama-dev libxi-dev \
+            libxxf86vm-dev libxcursor-dev libgl1-mesa-dev
 
       - name: Install c3c
         run: |
@@ -54,32 +55,26 @@ jobs:
       - name: Build
         run: |
           c3c --version
-          # Base command. For the cross targets you will likely need to point
-          # c3c's linker at the target libc — confirm the exact flag with
-          # `c3c build --help` and add it here. Candidates to look for: a
-          # sysroot option, or a C-compiler override (--cc) you can aim at the
-          # cross gcc, e.g. aarch64-linux-gnu-gcc / "gcc -m32".
           c3c build --target ${{ matrix.target }}
 
       - name: Package
         run: |
           set -euo pipefail
-          out="myapp-${{ matrix.target }}"
+          out="yate-${{ matrix.target }}"
           mkdir -p "dist/$out"
-          cp -r build/* "dist/$out"/     # adjust to your emitted binary + libs
-          # cp -r assets "dist/$out"/    # runtime assets
-          # cp icon.png "dist/$out"/     # your image
+          cp build/yate "dist/$out"/
+          # cp -r assets "dist/$out"/   # uncomment if yate needs runtime assets
           tar -C dist -czf "$out.tar.gz" "$out"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: myapp-${{ matrix.target }}
-          path: myapp-${{ matrix.target }}.tar.gz
+          name: yate-${{ matrix.target }}
+          path: yate-${{ matrix.target }}.tar.gz
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: myapp-${{ matrix.target }}.tar.gz
+          files: yate-${{ matrix.target }}.tar.gz
           fail_on_unmatched_files: false
