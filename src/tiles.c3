@@ -127,6 +127,20 @@ int  pcur_y;
 bool pcur_valid;   // the cursor is inside the Edit block this frame
 bool edit_hover;   // the mouse is over the Edit pane (routes Ctrl+C/X/V to pixels)
 
+// --- Cross-instance text clipboard -------------------------------------------
+// On copy/cut we also serialise the clipboard to a small ASCII payload and hand
+// it to the OS clipboard (raylib SetClipboardText); paste reads it back, so a
+// shape copied in one running instance can be pasted into another. Two payload
+// kinds, tagged by a header line:
+//   YATE1T <count>\n  then "<dcol> <drow> <32 hex bytes>\n" per tile
+//   YATE1P <w> <h>\n  then h rows of w cells ('.' = gap, 0..3 = pixel value)
+// last_clip keeps the exact text WE published, so a paste can tell our own copy
+// (keep the live cut/move state) from a foreign one (adopt it as a plain copy).
+const usz CLIP_TEXT_CAP = 32768;
+char[CLIP_TEXT_CAP] clip_text;  // scratch for the outgoing payload
+char[CLIP_TEXT_CAP] last_clip;  // the exact payload we last published to the OS
+bool have_last_clip;
+
 const RLColor BG        = { 22,  23,  26,  255 }; // backdrop behind the grid
 const RLColor BORDER    = { 60,  63,  70,  255 }; // empty-state outline
 const RLColor LINE      = { 230, 234, 242, 255 }; // thin white separators / outline (Edit pane, scrollbar)
@@ -704,6 +718,8 @@ fn void cut_or_copy(bool cut) {
     cut_src_row = amin_r;
     pasted      = false;  // a fresh shape is not spent yet
     msel_count  = 0;      // the anchor is now invisible; the paste preview takes over
+
+    clip_export_tiles();  // mirror the shape onto the OS clipboard for other instances
 }
 
 fn void copy_sel() => cut_or_copy(false); // Ctrl+C: paste leaves the source intact
@@ -777,6 +793,7 @@ fn void snap_commit() {
 // cleared and the clipboard is then dropped, so only the first paste lands. The
 // overwritten and cleared tiles are snapshotted as one undo step.
 fn void paste() {
+    clip_pull_tiles(); // adopt a foreign shape from the OS clipboard, if present
     if (data == null || clip_count == 0) return;
 
     int sc = sel % GRID;
@@ -965,6 +982,8 @@ fn void pixel_cut_or_copy(bool cut) {
     pcut_y0   = ylo;
     ppasted   = false;   // a fresh stamp is not spent yet
     psel_clear();        // the selection gives way to the paste preview
+
+    clip_export_pixels(); // mirror the stamp onto the OS clipboard for other instances
 }
 
 fn void pixel_copy() => pixel_cut_or_copy(false); // Ctrl+C in the editor
@@ -984,6 +1003,7 @@ fn bool pclip_dest_has(int sx, int sy, int dx, int dy) {
 // one-shot MOVE: source pixels the stamp didn't cover are cleared and the
 // clipboard dropped. Every touched tile snapshots as one shared undo step.
 fn void pixel_paste() {
+    clip_pull_pixels(); // adopt a foreign stamp from the OS clipboard, if present
     if (data == null || !pclip_on || !pcur_valid) return;
 
     int w  = sel_dim * 8;
@@ -1045,6 +1065,188 @@ fn void pixel_paste() {
 
     snap_commit();
     ppasted = true; // the stamp is spent: the next shift-stroke starts fresh
+}
+
+// --- Clipboard text codec ----------------------------------------------------
+// Serialise/parse the two clipboards to the ASCII payloads documented up top, and
+// shuttle them through the OS clipboard so copies cross between app instances.
+
+// Append helpers: write into buf[*o], never past cap-1 (room kept for a final NUL).
+fn void cb_str(char* buf, usz* o, usz cap, ZString s) {
+    usz k = 0;
+    while (s[k] != 0 && *o < cap - 1) { buf[*o] = s[k]; (*o)++; k++; }
+}
+fn void cb_uint(char* buf, usz* o, usz cap, int v) {
+    if (v < 0) v = 0;
+    char[12] tmp;
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0) { tmp[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n > 0 && *o < cap - 1) { buf[*o] = tmp[--n]; (*o)++; }
+}
+fn char cb_hexd(int v) => (char)(v < 10 ? '0' + v : 'a' + (v - 10));
+fn void cb_hex2(char* buf, usz* o, usz cap, int byte) {
+    if (*o < cap - 1) { buf[*o] = cb_hexd((byte >> 4) & 0xF); (*o)++; }
+    if (*o < cap - 1) { buf[*o] = cb_hexd(byte & 0xF);        (*o)++; }
+}
+
+// Copy clip_text into last_clip and hand it to the OS clipboard.
+fn void clip_publish() {
+    usz k = 0;
+    while (clip_text[k] != 0 && k < CLIP_TEXT_CAP - 1) { last_clip[k] = clip_text[k]; k++; }
+    last_clip[k] = 0;
+    have_last_clip = true;
+    rl::set_clipboard_text((ZString)&clip_text[0]);
+}
+
+// Serialise the tile clipboard (clip_*) as a YATE1T payload and publish it.
+fn void clip_export_tiles() {
+    usz o = 0;
+    cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, "YATE1T ");
+    cb_uint(&clip_text[0], &o, CLIP_TEXT_CAP, clip_count);
+    cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, "\n");
+    for (int i = 0; i < clip_count; i++) {
+        cb_uint(&clip_text[0], &o, CLIP_TEXT_CAP, clip_dcol[i]);
+        cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, " ");
+        cb_uint(&clip_text[0], &o, CLIP_TEXT_CAP, clip_drow[i]);
+        cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, " ");
+        usz base = (usz)i * TILE_BYTES;
+        for (int b = 0; b < TILE_BYTES; b++) {
+            cb_hex2(&clip_text[0], &o, CLIP_TEXT_CAP, (int)clip_px[base + (usz)b] & 0xFF);
+        }
+        cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, "\n");
+    }
+    clip_text[o] = 0;
+    clip_publish();
+}
+
+// Serialise the pixel clipboard (pclip_*) as a YATE1P payload and publish it.
+fn void clip_export_pixels() {
+    usz o = 0;
+    cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, "YATE1P ");
+    cb_uint(&clip_text[0], &o, CLIP_TEXT_CAP, pclip_w);
+    cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, " ");
+    cb_uint(&clip_text[0], &o, CLIP_TEXT_CAP, pclip_h);
+    cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, "\n");
+    for (int y = 0; y < pclip_h; y++) {
+        for (int x = 0; x < pclip_w; x++) {
+            int li = y * pclip_w + x;
+            char c = pclip_mask[li] ? (char)('0' + ((int)pclip_px[li] & 3)) : '.';
+            if (o < CLIP_TEXT_CAP - 1) { clip_text[o] = c; o++; }
+        }
+        cb_str(&clip_text[0], &o, CLIP_TEXT_CAP, "\n");
+    }
+    clip_text[o] = 0;
+    clip_publish();
+}
+
+// Parse helpers reading ZString `s` from *i.
+fn bool cp_ws(char c) => c == ' ' || c == '\n' || c == '\r' || c == '\t';
+fn void cp_skip(ZString s, usz* i) { while (cp_ws(s[*i])) (*i)++; }
+fn int cp_uint(ZString s, usz* i, bool* ok) {
+    cp_skip(s, i);
+    if (s[*i] < '0' || s[*i] > '9') { *ok = false; return 0; }
+    int v = 0;
+    while (s[*i] >= '0' && s[*i] <= '9') { v = v * 10 + (int)(s[*i] - '0'); (*i)++; }
+    return v;
+}
+fn int cp_hexd(char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    return -1;
+}
+
+// Header kind of `s`: 'T', 'P', or 0 when it is not a yate payload.
+fn char clip_kind(ZString s) {
+    if (s[0] == 'Y' && s[1] == 'A' && s[2] == 'T' && s[3] == 'E' && s[4] == '1') {
+        if (s[5] == 'T') return 'T';
+        if (s[5] == 'P') return 'P';
+    }
+    return 0;
+}
+
+// Is `s` byte-for-byte the payload we last published?
+fn bool clip_is_own(ZString s) {
+    if (!have_last_clip) return false;
+    usz k = 0;
+    while (true) {
+        char a = last_clip[k];
+        if (a != s[k]) return false;
+        if (a == 0) return true;
+        k++;
+    }
+}
+
+// Decode a YATE1T payload into clip_*. Returns false on any malformation, leaving
+// clip_count untouched so a bad parse can't silently empty the clipboard.
+fn bool clip_import_tiles(ZString s) {
+    usz i = 6; // past "YATE1T"
+    bool ok = true;
+    int count = cp_uint(s, &i, &ok);
+    if (!ok || count < 0 || count > CLIP_MAX) return false;
+    for (int n = 0; n < count; n++) {
+        int dc = cp_uint(s, &i, &ok);
+        int dr = cp_uint(s, &i, &ok);
+        if (!ok) return false;
+        cp_skip(s, &i);
+        for (int b = 0; b < TILE_BYTES; b++) {
+            int hi = cp_hexd(s[i]); if (hi < 0) return false; i++;
+            int lo = cp_hexd(s[i]); if (lo < 0) return false; i++;
+            clip_px[(usz)n * TILE_BYTES + (usz)b] = (char)((hi << 4) | lo);
+        }
+        clip_dcol[n] = dc;
+        clip_drow[n] = dr;
+    }
+    clip_count = count;
+    return true;
+}
+
+// Decode a YATE1P payload into pclip_*. Returns false on any malformation.
+fn bool clip_import_pixels(ZString s) {
+    usz i = 6; // past "YATE1P"
+    bool ok = true;
+    int w = cp_uint(s, &i, &ok);
+    int h = cp_uint(s, &i, &ok);
+    if (!ok || w < 1 || h < 1 || w > PCLIP_SIDE || h > PCLIP_SIDE) return false;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            cp_skip(s, &i);
+            char c = s[i];
+            if (c == 0) return false;
+            i++;
+            int li = y * w + x;
+            if (c == '.') { pclip_mask[li] = false; pclip_px[li] = 0; }
+            else if (c >= '0' && c <= '3') { pclip_mask[li] = true; pclip_px[li] = (char)(c - '0'); }
+            else { return false; }
+        }
+    }
+    pclip_w   = w;
+    pclip_h   = h;
+    pclip_on  = true;
+    pclip_cut = false; // a payload always pastes as a copy
+    ppasted   = false;
+    return true;
+}
+
+// Before a tile paste: adopt a YATE1T payload from the OS clipboard. Our own live
+// clip is left alone so its cut/move state survives; an empty local clip (e.g.
+// just after opening a file) re-adopts even our own published text.
+fn void clip_pull_tiles() {
+    ZString s = rl::get_clipboard_text();
+    if (s == null) return;
+    if (clip_kind(s) != 'T') return;
+    if (clip_count > 0 && clip_is_own(s)) return;
+    if (clip_import_tiles(s)) { cut_mode = false; pasted = false; }
+}
+
+// Before a pixel paste: the same, for a YATE1P payload.
+fn void clip_pull_pixels() {
+    ZString s = rl::get_clipboard_text();
+    if (s == null) return;
+    if (clip_kind(s) != 'P') return;
+    if (pclip_on && clip_is_own(s)) return;
+    clip_import_pixels(s);
 }
 
 // --- Tile transforms ---------------------------------------------------------
